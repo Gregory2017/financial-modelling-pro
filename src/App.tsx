@@ -15,6 +15,7 @@ import {
   calculateMarkovPrediction, calculateSMA, calculateTailRisk, detectCrosses
 } from './services/financeService';
 import { fetchLiveMarketData, fetchMacroReport } from './services/geminiService';
+import { fetchStockData, fetchQuote, fetchWaccData, fetchFundamentals } from './services/apiService';
 
 // --- Types ---
 interface StockData {
@@ -123,38 +124,35 @@ export default function App() {
     setCryptoNews(null);
     setGeminiPrice(null);
     
-    // Start Gemini verification immediately as it's our source of truth for "Current Price"
+    // Start Gemini verification immediately (optional - only works with API key)
     verifyPrice(t);
 
     try {
-      const [stockRes, fundRes, waccRes, quoteRes] = await Promise.all([
-        fetch(`/api/stock/${t}`),
-        fetch(`/api/fundamentals/${t}`),
-        fetch(`/api/wacc/${t}`),
-        fetch(`/api/quote/${t}`)
+      // Fetch all data using the apiService (direct calls with CORS proxy)
+      const [stockData, waccDataResult, fundamentalsData, quoteData] = await Promise.all([
+        fetchStockData(t),
+        fetchWaccData(t),
+        fetchFundamentals(t),
+        fetchQuote(t)
       ]);
 
-      if (!stockRes.ok) throw new Error('Failed to fetch stock data');
-      const rawData = await stockRes.json();
+      if (!stockData || stockData.length === 0) {
+        throw new Error('Failed to fetch stock data');
+      }
       
-      if (quoteRes.ok) {
-        const qData = await quoteRes.json();
-        // Prefer Yahoo Finance quote for the price, but keep Gemini sentiment if available
-        setQuote(prev => {
-          const newQuote = { ...qData };
-          if (prev?.source === 'Gemini AI Oracle (Live Search)') {
-            newQuote.sentiment = prev.sentiment;
-            newQuote.geminiVerifiedPrice = prev.regularMarketPrice;
-          }
-          
-          if (newQuote.regularMarketPrice) {
-            setBsParams(p => ({ ...p, S: newQuote.regularMarketPrice }));
+      // Set quote data
+      if (quoteData) {
+        setQuote((prev: any) => {
+          const newQuote = { ...quoteData };
+          if (quoteData.regularMarketPrice) {
+            setBsParams(p => ({ ...p, S: quoteData.regularMarketPrice }));
           }
           return newQuote;
         });
       }
       
-      const formattedData = rawData.map((d: any) => ({
+      // Format stock data
+      const formattedData = stockData.map((d: any) => ({
         date: new Date(d.date).toLocaleDateString(),
         close: d.close,
         open: d.open,
@@ -165,18 +163,13 @@ export default function App() {
       
       setData(formattedData);
 
-      if (waccRes.ok) {
-        const wData = await waccRes.json();
-        setWaccData(wData);
-        
-        if (wData.isCrypto) {
-          fetchMacroReport().then(setCryptoNews);
-        }
-
-        if (fundRes.ok && !wData.isCrypto) {
-          const fundData = await fundRes.json();
-          setFundamentals(fundData);
-        }
+      // Set WACC data
+      setWaccData(waccDataResult);
+      
+      if (waccDataResult.isCrypto) {
+        fetchMacroReport().then(setCryptoNews);
+      } else if (fundamentalsData) {
+        setFundamentals(fundamentalsData);
       }
 
     } catch (err: any) {

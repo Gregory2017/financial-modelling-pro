@@ -1,7 +1,7 @@
 import { GoogleGenAI, Type } from "@google/genai";
 
 export const getGeminiAI = () => {
-  return new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+  return new GoogleGenAI({ apiKey: import.meta.env.VITE_GEMINI_API_KEY || "" });
 };
 
 export const fetchLiveMarketData = async (ticker: string) => {
