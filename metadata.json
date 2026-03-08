@@ -1,0 +1,5 @@
+{
+  "name": "Financial Modelling Pro",
+  "description": "A comprehensive financial analytics dashboard featuring tail risk assessment, Black-Scholes option pricing, technical indicators (MACD, RSI), and Markov-based price prediction.",
+  "requestFramePermissions": []
+}
