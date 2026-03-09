@@ -1,7 +1,16 @@
 import { GoogleGenAI, Type } from "@google/genai";
 
-// CORS proxy for Yahoo Finance (free, no API key needed)
-const CORS_PROXY = "https://api.allorigins.win/raw?url=";
+// Multiple CORS proxies for Yahoo Finance (free, no API key needed)
+const CORS_PROXIES = [
+  "https://api.allorigins.win/raw?url=",
+  "https://corsproxy.io/?",
+  "https://proxy.corsfix.io/?",
+];
+
+function getProxyUrl(url: string): string {
+  // Try first proxy, if it fails we'll handle it in the fetch
+  return CORS_PROXIES[0] + encodeURIComponent(url);
+}
 
 export interface StockData {
   date: string;
@@ -33,32 +42,41 @@ export interface WaccData {
   isCrypto?: boolean;
 }
 
-// Yahoo Finance via query1.finance.yahoo.com
+// Yahoo Finance via query1.finance.yahoo.com with multiple proxy fallback
+async function fetchWithProxy(url: string, maxRetries = 3): Promise<any> {
+  let lastError;
+  
+  for (let i = 0; i < maxRetries; i++) {
+    const proxy = CORS_PROXIES[i % CORS_PROXIES.length];
+    const proxyUrl = proxy + encodeURIComponent(url);
+    
+    try {
+      const response = await fetch(proxyUrl, { 
+        signal: AbortSignal.timeout(10000)
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return await response.json();
+    } catch (error) {
+      console.warn(`Proxy ${proxy} failed:`, error);
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("All proxies failed");
+}
+
 async function fetchYahooFinance(query: string): Promise<any> {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(query)}?interval=1d&range=1y`;
-  const proxyUrl = CORS_PROXY + encodeURIComponent(url);
-  
-  const response = await fetch(proxyUrl);
-  if (!response.ok) throw new Error(`Yahoo Finance error: ${response.status}`);
-  return response.json();
+  return fetchWithProxy(url);
 }
 
 async function fetchYahooQuote(query: string): Promise<any> {
   const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(query)}`;
-  const proxyUrl = CORS_PROXY + encodeURIComponent(url);
-  
-  const response = await fetch(proxyUrl);
-  if (!response.ok) throw new Error(`Yahoo Quote error: ${response.status}`);
-  return response.json();
+  return fetchWithProxy(url);
 }
 
 async function fetchYahooSummary(query: string, modules: string): Promise<any> {
   const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(query)}?modules=${modules}`;
-  const proxyUrl = CORS_PROXY + encodeURIComponent(url);
-  
-  const response = await fetch(proxyUrl);
-  if (!response.ok) throw new Error(`Yahoo Summary error: ${response.status}`);
-  return response.json();
+  return fetchWithProxy(url);
 }
 
 // Normalize ticker
