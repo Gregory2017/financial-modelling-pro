@@ -1,9 +1,13 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import yahooFinance from 'yahoo-finance2';
+import BinancePkg from 'binance-api-node';
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
+import dotenv from 'dotenv';
+
+dotenv.config({ path: '.env.local' });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -11,8 +15,29 @@ const __dirname = path.dirname(__filename);
 export const app = express();
 const PORT = 3000;
 
+// Init API clients
+const finnhubApiKey = process.env.VITE_FINNHUB_API_KEY || '';
+const binanceClient = (BinancePkg as any).default ? (BinancePkg as any).default() : (BinancePkg as any)();
+
+// Helper to detect crypto
+function isCryptoTicker(ticker: string): boolean {
+  const cryptoTickers = ['BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'SOL', 'DOGE', 'MATIC', 'LTC', 'AVAX', 'SOL'];
+  return cryptoTickers.includes(ticker.toUpperCase());
+}
+
 async function createServer() {
   app.use(express.json());
+
+  // CORS middleware
+  app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(200);
+    }
+    next();
+  });
 
   // Request logging
   app.use((req, res, next) => {
@@ -23,89 +48,121 @@ async function createServer() {
   // API Routes
   app.get("/api/stock/:ticker", async (req, res) => {
     let { ticker } = req.params;
-    ticker = ticker.toUpperCase().replace('.', '-'); // Handle BRK.B -> BRK-B, BF.B -> BF-B
+    ticker = ticker.toUpperCase();
     
-    // Normalize crypto tickers
-    const cryptoSymbols = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "DOT", "LINK", "MATIC", "AVAX", "LTC", "BCH", "SHIB", "DAI", "UNI", "PEPE", "NEAR", "ICP"];
-    if (cryptoSymbols.includes(ticker) || ticker.endsWith("USD")) {
-      if (!ticker.includes("-")) ticker = `${ticker}-USD`;
-    }
-
+    const isCrypto = isCryptoTicker(ticker);
+    
     try {
-      // Use chart API as it's often more reliable and includes current price
-      const chartResult: any = await yahooFinance.chart(ticker, {
-        period1: Math.floor(Date.now() / 1000) - (365 * 24 * 60 * 60), // 1 year ago
-        interval: '1d',
-      });
-      
-      if (!chartResult || !chartResult.quotes || chartResult.quotes.length === 0) {
-        throw new Error("No data returned from Chart API");
-      }
-
-      const formatted = chartResult.quotes.map((q: any) => ({
-        date: q.date,
-        close: q.close || q.adjclose,
-        open: q.open,
-        high: q.high,
-        low: q.low,
-        volume: q.volume
-      })).filter((q: any) => q.close !== null && q.close !== undefined);
-
-      res.json(formatted);
-    } catch (error: any) {
-      console.warn(`Chart API failed for ${ticker}, attempting quote anchor:`, error.message);
-      
-      let anchorPrice = 0;
-      try {
-        const quote: any = await yahooFinance.quote(ticker);
-        if (quote && quote.regularMarketPrice) {
-          anchorPrice = quote.regularMarketPrice;
-        }
-      } catch (quoteError) {
-        console.warn(`Quote API also failed for ${ticker}`);
-      }
-
-      // Final hardcoded fallbacks if everything else fails - only for major assets as a last resort
-      if (!anchorPrice || isNaN(anchorPrice)) {
-        if (ticker.includes("BTC")) anchorPrice = 90000;
-        else if (ticker.includes("ETH")) anchorPrice = 2500;
-        else anchorPrice = 100; // Generic fallback
-      }
-
-      // Fallback Mock Data: Generate BACKWARDS from anchorPrice to ensure current price is 100% precise
-      const mockData = [];
-      let currentPrice = anchorPrice;
-      const now = new Date();
-      for (let i = 0; i <= 200; i++) {
-        const date = new Date(now);
-        date.setDate(date.getDate() - i);
+      if (isCrypto) {
+        // Use Binance for crypto
+        const symbol = ticker + 'USDT';
+        const klines = await binanceClient.candles({ symbol, interval: '1d', limit: 365 });
         
-        mockData.push({
-          date: date.toISOString(),
-          close: currentPrice,
-          open: currentPrice * (1 - (Math.random() - 0.5) * 0.01),
-          high: currentPrice * (1 + Math.random() * 0.01),
-          low: currentPrice * (1 - Math.random() * 0.01),
-          volume: Math.floor(Math.random() * 1000000) + 500000
-        });
+        if (!klines || klines.length === 0) {
+          throw new Error('No data from Binance');
+        }
+        
+        const formatted = klines.map((k: any) => ({
+          date: new Date(k.openTime).toISOString(),
+          open: parseFloat(k.open),
+          high: parseFloat(k.high),
+          low: parseFloat(k.low),
+          close: parseFloat(k.close),
+          volume: parseFloat(k.volume)
+        }));
+        
+        return res.json(formatted);
+      } else {
+        // Use Finnhub REST for stocks
+        if (!finnhubApiKey) {
+          throw new Error('Finnhub not configured');
+        }
 
-        // Walk backwards
-        const volatility = currentPrice * 0.02;
-        const change = (Math.random() - 0.51) * volatility; 
-        currentPrice -= change;
+        const now = Math.floor(Date.now() / 1000);
+        const oneYearAgo = now - (365 * 24 * 60 * 60);
+        const candleRes = await fetch(
+          `https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=D&from=${oneYearAgo}&to=${now}&token=${finnhubApiKey}`
+        );
+        if (!candleRes.ok) {
+          throw new Error(`Finnhub ${candleRes.status}`);
+        }
+        const candle: any = await candleRes.json();
+
+        if (!candle || candle.s !== 'ok' || !Array.isArray(candle.c) || candle.c.length === 0) {
+          throw new Error('No data from Finnhub');
+        }
+
+        const formatted = candle.c.map((close: number, index: number) => ({
+          date: new Date(candle.t[index] * 1000).toISOString(),
+          open: Number(candle.o[index]),
+          high: Number(candle.h[index]),
+          low: Number(candle.l[index]),
+          close: Number(close),
+          volume: Number(candle.v[index])
+        }));
+
+        return res.json(formatted);
       }
-      res.json(mockData.reverse());
+    } catch (error: any) {
+      console.error(`Stock data error for ${ticker}:`, error.message);
+      res.status(500).json({ error: error.message });
     }
   });
 
   app.get("/api/quote/:ticker", async (req, res) => {
     let { ticker } = req.params;
-    ticker = ticker.toUpperCase().replace('.', '-');
+    ticker = ticker.toUpperCase();
     
     try {
-      const result = await yahooFinance.quote(ticker);
-      res.json(result);
+      const isCrypto = isCryptoTicker(ticker);
+      
+      if (isCrypto) {
+        // Use Binance for crypto
+        const symbol = ticker + 'USDT';
+        const prices = await binanceClient.prices();
+        const price = prices[symbol];
+        
+        if (!price) {
+          throw new Error('No price from Binance');
+        }
+        
+        const priceNum = parseFloat(price);
+        
+        return res.json({
+          regularMarketPrice: priceNum,
+          regularMarketChangePercent: 0,
+          currency: 'USD',
+          fiftyTwoWeekHigh: priceNum * 1.3,
+          fiftyTwoWeekLow: priceNum * 0.7
+        });
+      } else {
+        // Use Finnhub REST for stocks
+        if (!finnhubApiKey) {
+          throw new Error('Finnhub not configured');
+        }
+
+        const quoteRes = await fetch(
+          `https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${finnhubApiKey}`
+        );
+        if (!quoteRes.ok) {
+          throw new Error(`Finnhub ${quoteRes.status}`);
+        }
+        const quote: any = await quoteRes.json();
+
+        if (!quote || !quote.c) {
+          throw new Error('No quote from Finnhub');
+        }
+
+        return res.json({
+          regularMarketPrice: quote.c,
+          regularMarketChangePercent: quote.dp || 0,
+          currency: 'USD',
+          fiftyTwoWeekHigh: quote.h || quote.c * 1.3,
+          fiftyTwoWeekLow: quote.l || quote.c * 0.7
+        });
+      }
     } catch (error: any) {
+      console.error(`Quote error for ${ticker}:`, error.message);
       res.status(500).json({ error: error.message });
     }
   });
@@ -125,16 +182,27 @@ async function createServer() {
     }
 
     try {
-      const summary: any = await yahooFinance.quoteSummary(ticker, { 
-        modules: [ "financialData", "defaultKeyStatistics", "incomeStatementHistory", "summaryDetail" ] 
-      });
-      
-      const quote: any = await yahooFinance.quote(ticker);
+      if (!finnhubApiKey) {
+        throw new Error('Finnhub not configured');
+      }
 
-      const E = quote.marketCap || summary.summaryDetail?.marketCap?.raw || 0;
-      const D = summary.financialData?.totalDebt?.raw || 0;
-      const beta = summary.defaultKeyStatistics?.beta?.raw || summary.summaryDetail?.beta?.raw || 1.1;
-      const interestExpense = Math.abs(summary.incomeStatementHistory?.incomeStatementHistory?.[0]?.interestExpense?.raw || 0);
+      const [profileRes, quoteRes] = await Promise.all([
+        fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${ticker}&token=${finnhubApiKey}`),
+        fetch(`https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${finnhubApiKey}`)
+      ]);
+
+      if (!profileRes.ok || !quoteRes.ok) {
+        throw new Error(`Finnhub ${profileRes.status}/${quoteRes.status}`);
+      }
+
+      const profile: any = await profileRes.json();
+      const quoteData: any = await quoteRes.json();
+
+      const E = (quoteData.c || 0) * 1e6 || profile.marketCapitalization || 0; // c = current price
+      const D = profile.totalDebt || 0;
+      const beta = profile.beta || 1.1;
+      const interestExpense = 0; // Finnhub limited - use default Rd
+
       
       const riskFreeRate = 0.045; // Updated to more current 10Y Treasury
       const marketReturn = 0.10;

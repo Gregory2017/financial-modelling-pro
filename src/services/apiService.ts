@@ -1,16 +1,5 @@
-import { GoogleGenAI, Type } from "@google/genai";
-
-// Multiple CORS proxies for Yahoo Finance (free, no API key needed)
-const CORS_PROXIES = [
-  "https://api.allorigins.win/raw?url=",
-  "https://corsproxy.io/?",
-  "https://proxy.corsfix.io/?",
-];
-
-function getProxyUrl(url: string): string {
-  // Try first proxy, if it fails we'll handle it in the fetch
-  return CORS_PROXIES[0] + encodeURIComponent(url);
-}
+import { fetchBinanceKlines, fetchBinanceTicker, fetchBinance24hrTicker, BinanceKline } from './binancePublic';
+// Removed duplicate client - use finnhubClient from finnhubService
 
 export interface StockData {
   date: string;
@@ -42,231 +31,190 @@ export interface WaccData {
   isCrypto?: boolean;
 }
 
-// Yahoo Finance via query1.finance.yahoo.com with multiple proxy fallback
-async function fetchWithProxy(url: string, maxRetries = 3): Promise<any> {
-  let lastError;
-  
-  for (let i = 0; i < maxRetries; i++) {
-    const proxy = CORS_PROXIES[i % CORS_PROXIES.length];
-    const proxyUrl = proxy + encodeURIComponent(url);
-    
-    try {
-      const response = await fetch(proxyUrl, { 
-        signal: AbortSignal.timeout(10000)
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return await response.json();
-    } catch (error) {
-      console.warn(`Proxy ${proxy} failed:`, error);
-      lastError = error;
-    }
-  }
-  throw lastError || new Error("All proxies failed");
-}
-
-async function fetchYahooFinance(query: string): Promise<any> {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(query)}?interval=1d&range=1y`;
-  return fetchWithProxy(url);
-}
-
-async function fetchYahooQuote(query: string): Promise<any> {
-  const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(query)}`;
-  return fetchWithProxy(url);
-}
-
-async function fetchYahooSummary(query: string, modules: string): Promise<any> {
-  const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(query)}?modules=${modules}`;
-  return fetchWithProxy(url);
-}
-
-// Normalize ticker
-function normalizeTicker(ticker: string): { ticker: string; isCrypto: boolean } {
-  let t = ticker.toUpperCase().replace('.', '-');
-  const cryptoSymbols = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "DOT", "LINK", "MATIC", "AVAX", "LTC", "BCH", "SHIB", "DAI", "UNI", "PEPE", "NEAR", "ICP"];
-  const isCrypto = cryptoSymbols.includes(t) || t.endsWith("USD") || t.includes("-USD");
-  if (isCrypto && !t.includes("-")) t = `${t}-USD`;
-  return { ticker: t, isCrypto };
-}
-
-// Get stock data
 export async function fetchStockData(ticker: string): Promise<StockData[]> {
-  const { ticker: normalized, isCrypto } = normalizeTicker(ticker);
-  
+  const upperTicker = ticker.toUpperCase();
+  const isCrypto = upperTicker.includes('BTC') || upperTicker.includes('ETH') || upperTicker.includes('SOL');
+  const symbol = isCrypto ? `${upperTicker}USDT` : upperTicker;
+
   try {
-    const data = await fetchYahooFinance(normalized);
-    const result = data.chart?.result?.[0];
-    if (!result) throw new Error("No data");
-    
-    const quotes = result.timestamp.map((timestamp: number, i: number) => ({
-      date: new Date(timestamp * 1000).toISOString(),
-      close: result.indicators?.quote?.[0]?.close?.[i] || 0,
-      open: result.indicators?.quote?.[0]?.open?.[i] || 0,
-      high: result.indicators?.quote?.[0]?.high?.[i] || 0,
-      low: result.indicators?.quote?.[0]?.low?.[i] || 0,
-      volume: result.indicators?.quote?.[0]?.volume?.[i] || 0
-    })).filter((q: any) => q.close !== null);
-    
-    return quotes;
+    if (isCrypto) {
+      const klines = await fetchBinanceKlines(symbol, '1d', 365);
+      if (!klines || klines.length === 0) return generateMockData(upperTicker);
+
+      return klines.slice(-365).map((k: BinanceKline) => ({
+        date: new Date(k.openTime).toISOString().split('T')[0],
+        open: parseFloat(k.open),
+        high: parseFloat(k.high),
+        low: parseFloat(k.low),
+        close: parseFloat(k.close),
+        volume: parseFloat(k.volume),
+      }));
+    }
+
+    const from = Math.floor(Date.now() / 1000) - 365 * 24 * 60 * 60;
+    const to = Math.floor(Date.now() / 1000);
+    const response = await fetch(
+      `https://finnhub.io/api/v1/stock/candle?symbol=${symbol}&resolution=D&from=${from}&to=${to}&token=${import.meta.env.VITE_FINNHUB_API_KEY || ''}`
+    );
+    if (!response.ok) {
+      console.warn('Finnhub failed:', response.status, '- using mock');
+      return generateMockData(upperTicker);
+    }
+    const finnhubData = await response.json();
+    if (finnhubData?.s !== 'ok' || !Array.isArray(finnhubData?.c) || finnhubData.c.length === 0) {
+      console.warn('Finnhub no data - using mock');
+      return generateMockData(upperTicker);
+    }
+
+    const data = finnhubData.c.map((close: number, i: number) => ({
+      date: new Date(finnhubData.t[i] * 1000).toISOString().split('T')[0],
+      open: finnhubData.o[i],
+      high: finnhubData.h[i],
+      low: finnhubData.l[i],
+      close,
+      volume: finnhubData.v[i],
+    })).filter((d: StockData) =>
+      Number.isFinite(d.open) &&
+      Number.isFinite(d.high) &&
+      Number.isFinite(d.low) &&
+      Number.isFinite(d.close) &&
+      Number.isFinite(d.volume)
+    );
+
+    return data.length > 0 ? data.slice(-365) : generateMockData(upperTicker);
   } catch (error) {
-    console.warn("Yahoo Finance failed, generating mock data:", error);
-    return generateMockData(ticker);
+    console.error('Stock API failed:', error);
+    return generateMockData(upperTicker);
+  }
+
+  function generateMockData(ticker: string): StockData[] {
+    const basePrice = ticker === 'BTC' ? 65000 : 250;
+    const data: StockData[] = [];
+    let price = basePrice;
+    const now = new Date();
+    for (let i = 364; i >= 0; i--) {
+      const date = new Date(now);
+      date.setDate(date.getDate() - i);
+      price *= 1 + (Math.random() - 0.5) * 0.02;
+      data.push({
+        date: date.toISOString().split('T')[0],
+        open: price * (0.99 + Math.random() * 0.02),
+        high: price * 1.02,
+        low: price * 0.98,
+        close: price,
+        volume: Math.floor(1e6 + Math.random() * 5e6),
+      });
+    }
+    return data;
   }
 }
 
-// Get quote data
 export async function fetchQuote(ticker: string): Promise<QuoteData | null> {
-  const { ticker: normalized } = normalizeTicker(ticker);
+  const isCrypto = ticker.toUpperCase().includes('BTC') || ticker.toUpperCase().includes('ETH') || ticker.toUpperCase().includes('SOL');
   
   try {
-    const data = await fetchYahooQuote(normalized);
-    const quote = data.quoteResponse?.result?.[0];
-    if (!quote) return null;
-    return {
-      regularMarketPrice: quote.regularMarketPrice || 0,
-      regularMarketChangePercent: quote.regularMarketChangePercent || 0,
-      currency: quote.currency || "USD",
-      fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh || 0,
-      fiftyTwoWeekLow: quote.fiftyTwoWeekLow || 0,
-      marketCap: quote.marketCap
-    };
+    if (isCrypto) {
+      const symbol = ticker.toUpperCase() + 'USDT';
+      const [tickerData, stats24h] = await Promise.all([
+        fetchBinanceTicker(symbol),
+        fetchBinance24hrTicker(symbol),
+      ]);
+
+      if (!tickerData) return null;
+      const price = parseFloat(tickerData.price);
+      const changePercent = stats24h ? parseFloat(stats24h.priceChangePercent) : 0;
+      const high = stats24h ? parseFloat(stats24h.highPrice) : price * 1.3;
+      const low = stats24h ? parseFloat(stats24h.lowPrice) : price * 0.7;
+
+      return {
+        regularMarketPrice: price,
+        regularMarketChangePercent: Number.isFinite(changePercent) ? changePercent : 0,
+        currency: 'USDT',
+        fiftyTwoWeekHigh: Number.isFinite(high) ? high : price * 1.3,
+        fiftyTwoWeekLow: Number.isFinite(low) ? low : price * 0.7,
+      };
+    } else {
+      const response = await fetch(
+        `https://finnhub.io/api/v1/quote?symbol=${ticker.toUpperCase()}&token=${import.meta.env.VITE_FINNHUB_API_KEY || ''}`
+      );
+      if (!response.ok) throw new Error(`Finnhub Quote API ${response.status}`);
+      const q = await response.json();
+      const quoteData = q ? {
+        regularMarketPrice: q.c,
+        regularMarketChangePercent: q.dp ?? 0,
+        currency: 'USD',
+        fiftyTwoWeekHigh: q.h || q.c * 1.3,
+        fiftyTwoWeekLow: q.l || q.c * 0.7,
+      } : null;
+      if (!quoteData || !quoteData.regularMarketPrice) return null;
+      return quoteData;
+    }
   } catch (error) {
-    console.warn("Yahoo Quote failed:", error);
+    console.error('Quote API failed:', error);
     return null;
   }
 }
 
-// Get WACC data
 export async function fetchWaccData(ticker: string): Promise<WaccData> {
-  const { ticker: normalized, isCrypto } = normalizeTicker(ticker);
+  const isCrypto = ticker.toUpperCase().includes('BTC') || ticker.toUpperCase().includes('ETH');
   
   if (isCrypto) {
-    return { isCrypto: true, equity: 0, debt: 0, beta: 0, re: 0, rd: 0, taxRate: 0, riskFreeRate: 0.045, marketReturn: 0.10 };
-  }
-  
-  try {
-    const [quoteData, summaryData] = await Promise.all([
-      fetchYahooQuote(normalized),
-      fetchYahooSummary(normalized, "financialData,defaultKeyStatistics,summaryDetail")
-    ]);
-    
-    const quote = quoteData.quoteResponse?.result?.[0];
-    const summary = summaryData.quoteSummary?.result?.[0];
-    
-    const E = quote?.marketCap || summary?.summaryDetail?.marketCap?.raw || 0;
-    const D = summary?.financialData?.totalDebt?.raw || 0;
-    const beta = summary?.defaultKeyStatistics?.beta?.raw || summary?.summaryDetail?.beta?.raw || 1.1;
-    const interestExpense = Math.abs(summary?.incomeStatementHistory?.incomeStatementHistory?.[0]?.interestExpense?.raw || 0);
-    
-    const riskFreeRate = 0.045;
-    const marketReturn = 0.10;
-    const taxRate = 0.21;
-    const Re = riskFreeRate + beta * (marketReturn - riskFreeRate);
-    const Rd = D > 0 ? interestExpense / D : 0.05;
-    
-    return { equity: E, debt: D, beta, re: Re, rd: Rd, taxRate, riskFreeRate, marketReturn };
-  } catch (error) {
-    console.warn("WACC fetch failed, using defaults:", error);
     return {
-      equity: 100e9, debt: 10e9, beta: 1.1, re: 0.10, rd: 0.05, taxRate: 0.21, riskFreeRate: 0.045, marketReturn: 0.10
+      isCrypto: true,
+      equity: 0,
+      debt: 0,
+      beta: 2.5, // Crypto beta higher
+      re: 0.15,
+      rd: 0,
+      taxRate: 0,
+      riskFreeRate: 0.045,
+      marketReturn: 0.10
     };
   }
+  
+  try {
+    const [profileRes, quoteRes] = await Promise.all([
+      fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${ticker.toUpperCase()}&token=${import.meta.env.VITE_FINNHUB_API_KEY || ''}`),
+      fetch(`https://finnhub.io/api/v1/quote?symbol=${ticker.toUpperCase()}&token=${import.meta.env.VITE_FINNHUB_API_KEY || ''}`)
+    ]);
+    if (!profileRes.ok || !quoteRes.ok) throw new Error(`Finnhub WACC API ${profileRes.status}/${quoteRes.status}`);
+    const profile = await profileRes.json();
+    const quote = await quoteRes.json();
+
+    const equity = (quote?.c || 0) * 1e6 || profile?.marketCapitalization || 0;
+    const debt = profile?.totalDebt || 0;
+    const beta = profile?.beta || 1.1;
+    const riskFreeRate = 0.045;
+    const marketReturn = 0.1;
+    const taxRate = 0.21;
+    const re = riskFreeRate + beta * (marketReturn - riskFreeRate);
+    const rd = debt > 0 ? 0.05 : 0.05;
+
+    return { equity, debt, beta, re, rd, taxRate, riskFreeRate, marketReturn };
+  } catch (error) {
+    console.error('WACC API failed:', error);
+    throw error;
+  }
 }
 
-// Get fundamentals
 export async function fetchFundamentals(ticker: string): Promise<any> {
-  const { ticker: normalized, isCrypto } = normalizeTicker(ticker);
-  
-  if (isCrypto) return null;
-  
   try {
-    const data = await fetchYahooSummary(normalized, "incomeStatementHistory,balanceSheetHistory,cashflowStatementHistory");
-    const result = data.quoteSummary?.result?.[0];
-    if (!result?.incomeStatementHistory) throw new Error("No fundamentals");
-    return result;
+    const response = await fetch(
+      `https://finnhub.io/api/v1/stock/profile2?symbol=${ticker.toUpperCase()}&token=${import.meta.env.VITE_FINNHUB_API_KEY || ''}`
+    );
+    if (!response.ok) throw new Error(`Finnhub Fundamentals API ${response.status}`);
+    return await response.json();
   } catch (error) {
-    console.warn("Fundamentals fetch failed:", error);
+    console.warn('Fundamentals API failed:', error);
     return null;
   }
 }
 
-// Gemini AI for live price verification
 export async function fetchLiveMarketData(ticker: string) {
-  try {
-    const apiKey = import.meta.env.VITE_GEMINI_API_KEY || "";
-    if (!apiKey) {
-      console.warn("GEMINI_API_KEY not set");
-      return null;
-    }
-    
-    const ai = new GoogleGenAI({ apiKey });
-    const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
-      contents: `Search for the real-time market data for ${ticker}. Provide the current price, the 24h percentage change, the currency, and a brief 1-sentence market sentiment.`,
-      config: {
-        tools: [{ googleSearch: {} }],
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            price: { type: Type.NUMBER },
-            changePercent: { type: Type.NUMBER },
-            currency: { type: Type.STRING },
-            sentiment: { type: Type.STRING },
-            lastUpdated: { type: Type.STRING }
-          },
-          required: ["price", "changePercent", "currency"]
-        }
-      },
-    });
-    
-    return JSON.parse(response.text || '{}');
-  } catch (error) {
-    console.error("Gemini Market Data Error:", error);
-    return null;
-  }
+  return null;
 }
 
 export async function fetchMacroReport(): Promise<string | null> {
-  try {
-    const apiKey = import.meta.env.VITE_GEMINI_API_KEY || "";
-    if (!apiKey) return null;
-    
-    const ai = new GoogleGenAI({ apiKey });
-    const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
-      contents: "Provide a brief macroeconomic report (2-3 paragraphs) about current market conditions.",
-      config: { tools: [{ googleSearch: {} }] }
-    });
-    return response.text || null;
-  } catch (error) {
-    console.error("Gemini Macro Report failed:", error);
-    return null;
-  }
-}
-
-// Generate mock data as fallback
-function generateMockData(ticker: string): StockData[] {
-  const data: StockData[] = [];
-  let price = 100;
-  if (ticker.toUpperCase().includes("BTC")) price = 90000;
-  else if (ticker.toUpperCase().includes("ETH")) price = 2500;
-  else if (ticker.toUpperCase().includes("TSLA")) price = 250;
-  else if (ticker.toUpperCase().includes("AAPL")) price = 180;
-  else if (ticker.toUpperCase().includes("NVDA")) price = 500;
-  
-  for (let i = 200; i >= 0; i--) {
-    const date = new Date();
-    date.setDate(date.getDate() - i);
-    price *= 1 + (Math.random() - 0.5) * 0.04;
-    data.push({
-      date: date.toISOString(),
-      close: price,
-      open: price * (1 - Math.random() * 0.01),
-      high: price * (1 + Math.random() * 0.02),
-      low: price * (1 - Math.random() * 0.02),
-      volume: Math.floor(Math.random() * 10000000)
-    });
-  }
-  return data;
+  return null;
 }
 
